@@ -1,80 +1,542 @@
+```python
 import json
-import boto3
-import uuid
 import os
-from datetime import datetime
+import uuid
+from datetime import datetime, timezone
+from decimal import Decimal
+
+import boto3
+from boto3.dynamodb.conditions import Attr
+
 
 dynamodb = boto3.resource("dynamodb")
 table = dynamodb.Table(os.environ["TABLE_NAME"])
 
+ALLOWED_ORIGIN = os.environ.get(
+    "ALLOWED_ORIGIN",
+    "https://main.d2enx1f7w0atjj.amplifyapp.com"
+)
 
-def create_response(status_code, body):
+
+class DecimalEncoder(json.JSONEncoder):
+    """Allow DynamoDB Decimal values to be returned as JSON."""
+
+    def default(self, value):
+        if isinstance(value, Decimal):
+            return int(value) if value % 1 == 0 else float(value)
+
+        return super().default(value)
+
+
+def response(status_code, body):
+    """Create a consistent API Gateway response."""
+
     return {
         "statusCode": status_code,
         "headers": {
             "Content-Type": "application/json",
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
-            "Access-Control-Allow-Headers": "Content-Type"
+            "Access-Control-Allow-Origin": ALLOWED_ORIGIN,
+            "Access-Control-Allow-Headers": (
+                "Content-Type,Authorization,Accept"
+            ),
+            "Access-Control-Allow-Methods": (
+                "GET,POST,PUT,DELETE,OPTIONS"
+            )
         },
-        "body": json.dumps(body)
+        "body": json.dumps(body, cls=DecimalEncoder)
     }
 
 
-def lambda_handler(event, context):
+def get_http_method(event):
+    """Support API Gateway HTTP API and REST API event formats."""
+
+    return (
+        event.get("requestContext", {})
+        .get("http", {})
+        .get("method")
+        or event.get("httpMethod", "")
+    ).upper()
+
+
+def get_path(event):
+    """Return the request path from an API Gateway event."""
+
+    return (
+        event.get("rawPath")
+        or event.get("path")
+        or ""
+    )
+
+
+def get_claims(event):
+    """
+    Read authenticated Cognito claims.
+
+    HTTP API JWT authorizer claims are normally located at:
+    requestContext.authorizer.jwt.claims
+    """
+
+    authorizer = (
+        event.get("requestContext", {})
+        .get("authorizer", {})
+    )
+
+    jwt_claims = authorizer.get("jwt", {}).get("claims", {})
+
+    # This fallback also supports some REST API Cognito authorizer formats.
+    rest_claims = authorizer.get("claims", {})
+
+    return jwt_claims or rest_claims or {}
+
+
+def get_authenticated_user(event):
+    """Return safe account information from the Cognito token."""
+
+    claims = get_claims(event)
+
+    user_id = claims.get("sub")
+    email = claims.get("email")
+    display_name = (
+        claims.get("name")
+        or claims.get("preferred_username")
+        or email
+        or "ShareBite user"
+    )
+
+    if not user_id:
+        return None
+
+    return {
+        "userId": user_id,
+        "email": email,
+        "displayName": display_name
+    }
+
+
+def parse_body(event):
+    """Safely parse the request body."""
+
+    raw_body = event.get("body")
+
+    if not raw_body:
+        return {}
+
+    if isinstance(raw_body, dict):
+        return raw_body
+
     try:
-        method = event.get("requestContext", {}).get("http", {}).get("method", "")
+        return json.loads(raw_body)
+    except json.JSONDecodeError:
+        raise ValueError("The request body is not valid JSON.")
 
-        if method == "OPTIONS":
-            return create_response(200, {"message": "CORS successful"})
 
-        if method == "POST":
-            body = json.loads(event.get("body", "{}"))
+def normalise_text(value, max_length=None):
+    """Trim text and optionally restrict its maximum length."""
 
-            food_name = body.get("foodName", "").strip()
-            quantity = body.get("quantity", "").strip()
-            location = body.get("location", "").strip()
+    text = str(value or "").strip()
 
-            if not food_name or not quantity or not location:
-                return create_response(400, {
-                    "message": "foodName, quantity and location are required"
+    if max_length is not None:
+        text = text[:max_length]
+
+    return text
+
+
+def get_listing_id(event):
+    """Read listingId from route parameters or query parameters."""
+
+    path_parameters = event.get("pathParameters") or {}
+    query_parameters = event.get("queryStringParameters") or {}
+
+    return (
+        path_parameters.get("listingId")
+        or query_parameters.get("listingId")
+    )
+
+
+def get_available_listings():
+    """Return all currently available listings."""
+
+    items = []
+    scan_kwargs = {
+        "FilterExpression": Attr("status").eq("Available")
+    }
+
+    while True:
+        result = table.scan(**scan_kwargs)
+        items.extend(result.get("Items", []))
+
+        last_key = result.get("LastEvaluatedKey")
+
+        if not last_key:
+            break
+
+        scan_kwargs["ExclusiveStartKey"] = last_key
+
+    items.sort(
+        key=lambda item: item.get("createdAt", ""),
+        reverse=True
+    )
+
+    return items
+
+
+def get_my_listings(user_id):
+    """Return listings belonging to the authenticated user."""
+
+    items = []
+    scan_kwargs = {
+        "FilterExpression": Attr("ownerUserId").eq(user_id)
+    }
+
+    while True:
+        result = table.scan(**scan_kwargs)
+        items.extend(result.get("Items", []))
+
+        last_key = result.get("LastEvaluatedKey")
+
+        if not last_key:
+            break
+
+        scan_kwargs["ExclusiveStartKey"] = last_key
+
+    items.sort(
+        key=lambda item: item.get("createdAt", ""),
+        reverse=True
+    )
+
+    return items
+
+
+def lambda_handler(event, context):
+    method = get_http_method(event)
+    path = get_path(event)
+
+    # API Gateway can normally handle CORS itself, but this keeps
+    # compatibility with the current ShareBite implementation.
+    if method == "OPTIONS":
+        return response(200, {"message": "CORS OK"})
+
+    try:
+        # ---------------------------------------------------------
+        # GET AVAILABLE FOOD LISTINGS
+        # ---------------------------------------------------------
+        if method == "GET" and not path.endswith("/mine"):
+            items = get_available_listings()
+            return response(200, items)
+
+        # ---------------------------------------------------------
+        # GET AUTHENTICATED USER'S LISTINGS
+        # Route: GET /food/mine
+        # ---------------------------------------------------------
+        if method == "GET" and path.endswith("/mine"):
+            user = get_authenticated_user(event)
+
+            if not user:
+                return response(401, {
+                    "message": "Authentication is required."
                 })
 
+            items = get_my_listings(user["userId"])
+            return response(200, items)
+
+        # ---------------------------------------------------------
+        # POST NEW FOOD LISTING
+        # ---------------------------------------------------------
+        if method == "POST":
+            user = get_authenticated_user(event)
+
+            if not user:
+                return response(401, {
+                    "message": (
+                        "Authentication is required before creating "
+                        "a food listing."
+                    )
+                })
+
+            body = parse_body(event)
+
+            required_fields = [
+                "foodName",
+                "category",
+                "description",
+                "quantity",
+                "unit",
+                "location",
+                "expiryTime",
+                "foodCondition",
+                "allergyInfo"
+            ]
+
+            missing_fields = [
+                field
+                for field in required_fields
+                if not normalise_text(body.get(field))
+            ]
+
+            if missing_fields:
+                return response(400, {
+                    "message": (
+                        "Missing required fields: "
+                        + ", ".join(missing_fields)
+                    )
+                })
+
+            listing_id = str(uuid.uuid4())
+            created_at = datetime.now(timezone.utc).isoformat()
+
             item = {
-                "listingId": str(uuid.uuid4()),
-                "foodName": food_name,
-                "quantity": quantity,
-                "location": location,
-                "expiryTime": body.get("expiryTime", "").strip(),
-                "donorName": body.get("donorName", "").strip(),
-                "contactNumber": body.get("contactNumber", "").strip(),
+                "listingId": listing_id,
+                "ownerUserId": user["userId"],
+                "donorName": user["displayName"],
+
+                "foodName": normalise_text(
+                    body.get("foodName"),
+                    80
+                ),
+                "category": normalise_text(
+                    body.get("category"),
+                    60
+                ),
+                "description": normalise_text(
+                    body.get("description"),
+                    600
+                ),
+                "quantity": normalise_text(
+                    body.get("quantity"),
+                    50
+                ),
+                "unit": normalise_text(
+                    body.get("unit"),
+                    30
+                ),
+                "location": normalise_text(
+                    body.get("location"),
+                    120
+                ),
+                "expiryTime": normalise_text(
+                    body.get("expiryTime"),
+                    50
+                ),
+                "foodCondition": normalise_text(
+                    body.get("foodCondition"),
+                    80
+                ),
+                "allergyInfo": normalise_text(
+                    body.get("allergyInfo"),
+                    400
+                ),
+                "dietaryType": normalise_text(
+                    body.get("dietaryType"),
+                    80
+                ),
+                "storageInstructions": normalise_text(
+                    body.get("storageInstructions"),
+                    300
+                ),
+                "collectionInstructions": normalise_text(
+                    body.get("collectionInstructions"),
+                    300
+                ),
+
+                # These will be filled after the S3 image upload step.
+                "imageKey": normalise_text(
+                    body.get("imageKey"),
+                    500
+                ),
+                "imageUrl": normalise_text(
+                    body.get("imageUrl"),
+                    1000
+                ),
+
                 "status": "Available",
-                "createdAt": datetime.utcnow().isoformat()
+                "createdAt": created_at,
+                "updatedAt": created_at
             }
 
-            table.put_item(Item=item)
+            table.put_item(
+                Item=item,
+                ConditionExpression=(
+                    "attribute_not_exists(listingId)"
+                )
+            )
 
-            return create_response(201, {
-                "message": "Food listing added successfully",
+            return response(201, {
+                "message": "Food listing added successfully.",
+                "listingId": listing_id,
                 "item": item
             })
 
-        if method == "GET":
-            result = table.scan()
-            items = result.get("Items", [])
+        # ---------------------------------------------------------
+        # UPDATE AN EXISTING FOOD LISTING
+        # ---------------------------------------------------------
+        if method == "PUT":
+            user = get_authenticated_user(event)
 
-            return create_response(200, {
-                "message": "Food listings retrieved successfully",
-                "count": len(items),
-                "items": items
+            if not user:
+                return response(401, {
+                    "message": "Authentication is required."
+                })
+
+            listing_id = get_listing_id(event)
+
+            if not listing_id:
+                return response(400, {
+                    "message": "A listingId is required."
+                })
+
+            existing_result = table.get_item(
+                Key={"listingId": listing_id}
+            )
+
+            existing_item = existing_result.get("Item")
+
+            if not existing_item:
+                return response(404, {
+                    "message": "Food listing not found."
+                })
+
+            if existing_item.get("ownerUserId") != user["userId"]:
+                return response(403, {
+                    "message": (
+                        "You can only edit your own food listings."
+                    )
+                })
+
+            body = parse_body(event)
+
+            allowed_fields = [
+                "foodName",
+                "category",
+                "description",
+                "quantity",
+                "unit",
+                "location",
+                "expiryTime",
+                "foodCondition",
+                "allergyInfo",
+                "dietaryType",
+                "storageInstructions",
+                "collectionInstructions",
+                "imageKey",
+                "imageUrl",
+                "status"
+            ]
+
+            expression_names = {}
+            expression_values = {}
+            update_parts = []
+
+            for field in allowed_fields:
+                if field in body:
+                    name_key = f"#{field}"
+                    value_key = f":{field}"
+
+                    expression_names[name_key] = field
+                    expression_values[value_key] = normalise_text(
+                        body.get(field),
+                        1000
+                    )
+                    update_parts.append(
+                        f"{name_key} = {value_key}"
+                    )
+
+            expression_names["#updatedAt"] = "updatedAt"
+            expression_values[":updatedAt"] = (
+                datetime.now(timezone.utc).isoformat()
+            )
+            update_parts.append(
+                "#updatedAt = :updatedAt"
+            )
+
+            if len(update_parts) == 1:
+                return response(400, {
+                    "message": "No update fields were provided."
+                })
+
+            result = table.update_item(
+                Key={"listingId": listing_id},
+                UpdateExpression=(
+                    "SET " + ", ".join(update_parts)
+                ),
+                ExpressionAttributeNames=expression_names,
+                ExpressionAttributeValues=expression_values,
+                ReturnValues="ALL_NEW"
+            )
+
+            return response(200, {
+                "message": "Food listing updated successfully.",
+                "item": result.get("Attributes", {})
             })
 
-        return create_response(405, {
-            "message": "Method not allowed"
+        # ---------------------------------------------------------
+        # DELETE AN EXISTING FOOD LISTING
+        # ---------------------------------------------------------
+        if method == "DELETE":
+            user = get_authenticated_user(event)
+
+            if not user:
+                return response(401, {
+                    "message": "Authentication is required."
+                })
+
+            listing_id = get_listing_id(event)
+
+            if not listing_id:
+                return response(400, {
+                    "message": "A listingId is required."
+                })
+
+            existing_result = table.get_item(
+                Key={"listingId": listing_id}
+            )
+
+            existing_item = existing_result.get("Item")
+
+            if not existing_item:
+                return response(404, {
+                    "message": "Food listing not found."
+                })
+
+            if existing_item.get("ownerUserId") != user["userId"]:
+                return response(403, {
+                    "message": (
+                        "You can only delete your own food listings."
+                    )
+                })
+
+            table.delete_item(
+                Key={"listingId": listing_id}
+            )
+
+            return response(200, {
+                "message": "Food listing deleted successfully."
+            })
+
+        return response(405, {
+            "message": "Method not allowed."
+        })
+
+    except ValueError as error:
+        return response(400, {
+            "message": str(error)
         })
 
     except Exception as error:
-        return create_response(500, {
-            "message": "Internal server error",
-            "error": str(error)
+        print(
+            json.dumps({
+                "error": str(error),
+                "requestId": getattr(
+                    context,
+                    "aws_request_id",
+                    None
+                )
+            })
+        )
+
+        return response(500, {
+            "message": (
+                "An unexpected server error occurred. "
+                "Check the CloudWatch logs."
+            )
         })
+```
